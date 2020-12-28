@@ -8,14 +8,12 @@ import (
 	. "github.com/mickael-kerjean/filestash/server/common"
 	. "github.com/mickael-kerjean/filestash/server/middleware"
 	"io"
-	"math"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"time"
 )
 
 const (
@@ -79,12 +77,11 @@ func init(){
 	}
 
 	cachePath := filepath.Join(GetCurrentDir(), VideoCachePath)
-	os.RemoveAll(cachePath)
 	os.MkdirAll(cachePath, os.ModePerm)
 
 	Hooks.Register.ProcessFileContentBeforeSend(hls_playlist)
 	Hooks.Register.HttpEndpoint(func(r *mux.Router, app *App) error {
-		r.PathPrefix("/hls/hls_{segment}.ts").Handler(NewMiddlewareChain(
+		r.PathPrefix("/hls").Handler(NewMiddlewareChain(
 			get_transcoded_segment,
 			[]Middleware{ SecureHeaders },
 			*app,
@@ -134,45 +131,42 @@ func hls_playlist(reader io.ReadCloser, ctx *App, res *http.ResponseWriter, req 
 		Log.Stdout("ERR %+v", err)
 		return reader, err
 	}
-	io.Copy(f, reader)
-	reader.Close()
 	f.Close()
 
-	go hls_transcode(cachePath)
-
-	time.AfterFunc(CLEAR_CACHE_AFTER * time.Hour, func() { os.Remove(cachePath) })
-
-	p, err := ffprobe(cachePath)
-	if err != nil {
-		return reader, err
+	cachePathFolder := cachePath + "_transcoded"
+	if _, err := os.Stat(cachePathFolder); os.IsNotExist(err) {
+		os.MkdirAll(cachePathFolder, os.ModePerm)
+		go hls_transcode(reader, cachePath, cacheName)
 	}
 
 	var response string
-	var i int
-	response =  "#EXTM3U\n"
-	response += "#EXT-X-VERSION:3\n"
-	response += "#EXT-X-MEDIA-SEQUENCE:0\n"
-	response += "#EXT-X-ALLOW-CACHE:YES\n"
-	response += fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", HLS_SEGMENT_LENGTH)
-	for i=0; i< int(p.Format.Duration) / HLS_SEGMENT_LENGTH; i++ {
-		response += fmt.Sprintf("#EXTINF:%d.0000, nodesc\n", HLS_SEGMENT_LENGTH)
-		response += fmt.Sprintf("/hls/hls_%d.ts?path=%s\n", i, cacheName)
+	playlistPath := cachePath + ".m3u8"
+	if _, err := os.Stat(playlistPath); err == nil {
+		content, err := ioutil.ReadFile(playlistPath)
+		if err != nil {
+			Log.Info("[plugin hls]: couldn't read playlist file %+v", err)
+			return reader, err
+		}
+
+		response = string(content)
+		Log.Stdout(response)
+		f.Close()
+	} else {
+		response =  "#EXTM3U\n"
+		response += "#EXT-X-VERSION:3\n"
+		response += "#EXT-X-MEDIA-SEQUENCE:0\n"
+		response += "#EXT-X-ALLOW-CACHE:YES\n"
 	}
-	if md := math.Mod(p.Format.Duration, HLS_SEGMENT_LENGTH); md > 0 {
-		response += fmt.Sprintf("#EXTINF:%.4f, nodesc\n", md)
-		response += fmt.Sprintf("/hls/hls_%d.ts?path=%s\n", i, cacheName)
-	}
-	response += "#EXT-X-ENDLIST\n"
+
 	(*res).Header().Set("Content-Type", "application/x-mpegURL")
 	return NewReadCloserFromBytes([]byte(response)), nil
 }
 
-func hls_transcode(cachePath string) {
+func hls_transcode(reader io.ReadCloser, cachePath string, cacheName string) {
 	cachePathFolder := cachePath + "_transcoded"
-	os.MkdirAll(cachePathFolder, os.ModePerm)
 
 	cmd := exec.Command("ffmpeg", []string{
-		"-i", cachePath,
+		"-i", "pipe:input.dat",
 		"-vf", fmt.Sprintf("scale=-2:%d", 720),
 		"-vcodec", "libx264",
 		"-preset", "veryfast",
@@ -181,22 +175,19 @@ func hls_transcode(cachePath string) {
 		"-pix_fmt", "yuv420p",
 		"-x264opts:0", "subme=0:me_range=4:rc_lookahead=10:me=dia:no_chroma_me:8x8dct=0:partitions=none",
 		"-f", "hls",
+		"-hls_playlist_type", "event",
+		"-hls_base_url", fmt.Sprintf("/hls?path=%s&file=", cacheName),
 		"-hls_time", fmt.Sprintf("%d.00", HLS_SEGMENT_LENGTH),
 		"-hls_segment_filename", cachePathFolder + "/%03d.ts",
 		"-vsync", "2",
-		"pipe:hls.m3u8",
+		cachePath + ".m3u8",
 	}...)
 
+	cmd.Stdin = reader
 	_ = cmd.Run()
 }
 
 func get_transcoded_segment(ctx App, res http.ResponseWriter, req *http.Request) {
-	segmentNumber, err := strconv.Atoi(mux.Vars(req)["segment"])
-	if err != nil {
-		Log.Info("[plugin hls] invalid segment request '%s'", mux.Vars(req)["segment"])
-		res.WriteHeader(http.StatusBadRequest)
-		return
-	}
 	cachePath := filepath.Join(
 		GetCurrentDir(),
 		VideoCachePath,
@@ -210,7 +201,7 @@ func get_transcoded_segment(ctx App, res http.ResponseWriter, req *http.Request)
 
 	transcodedSegmentPath := filepath.Join(
 		cachePath + "_transcoded",
-		fmt.Sprintf("%03d.ts", segmentNumber),
+		req.URL.Query().Get("file"),
 	)
 
 	if _, err := os.Stat(transcodedSegmentPath); err == nil {
