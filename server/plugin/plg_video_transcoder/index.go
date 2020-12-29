@@ -126,17 +126,24 @@ func hls_playlist(reader io.ReadCloser, ctx *App, res *http.ResponseWriter, req 
 		VideoCachePath,
 		cacheName,
 	)
-	f, err := os.OpenFile(cachePath, os.O_CREATE | os.O_RDWR, os.ModePerm)
-	if err != nil {
-		Log.Stdout("ERR %+v", err)
-		return reader, err
+
+	if _, err := os.Stat(cachePath); os.IsNotExist(err) {
+	    f, err := os.OpenFile(cachePath, os.O_CREATE | os.O_RDWR, os.ModePerm)
+	    if err != nil {
+		    Log.Stdout("ERR %+v", err)
+		    return reader, err
+	    }
+	    io.Copy(f, reader)
+	    reader.Close()
+	    f.Close()
+	} else {
+	    reader.Close()
 	}
-	f.Close()
 
 	cachePathFolder := cachePath + "_transcoded"
 	if _, err := os.Stat(cachePathFolder); os.IsNotExist(err) {
 		os.MkdirAll(cachePathFolder, os.ModePerm)
-		go hls_transcode(reader, cachePath, cacheName)
+		go hls_transcode(cachePath, cacheName)
 	}
 
 	var response string
@@ -149,8 +156,6 @@ func hls_playlist(reader io.ReadCloser, ctx *App, res *http.ResponseWriter, req 
 		}
 
 		response = string(content)
-		Log.Stdout(response)
-		f.Close()
 	} else {
 		response =  "#EXTM3U\n"
 		response += "#EXT-X-VERSION:3\n"
@@ -162,11 +167,11 @@ func hls_playlist(reader io.ReadCloser, ctx *App, res *http.ResponseWriter, req 
 	return NewReadCloserFromBytes([]byte(response)), nil
 }
 
-func hls_transcode(reader io.ReadCloser, cachePath string, cacheName string) {
+func hls_transcode(cachePath string, cacheName string) {
 	cachePathFolder := cachePath + "_transcoded"
 
 	cmd := exec.Command("ffmpeg", []string{
-		"-i", "pipe:input.dat",
+		"-i", cachePath,
 		"-vf", fmt.Sprintf("scale=-2:%d", 720),
 		"-vcodec", "libx264",
 		"-preset", "veryfast",
@@ -179,11 +184,13 @@ func hls_transcode(reader io.ReadCloser, cachePath string, cacheName string) {
 		"-hls_base_url", fmt.Sprintf("/hls?path=%s&file=", cacheName),
 		"-hls_time", fmt.Sprintf("%d.00", HLS_SEGMENT_LENGTH),
 		"-hls_segment_filename", cachePathFolder + "/%03d.ts",
+		"-copyts",
 		"-vsync", "2",
 		cachePath + ".m3u8",
 	}...)
 
-	cmd.Stdin = reader
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	_ = cmd.Run()
 }
 
@@ -193,11 +200,6 @@ func get_transcoded_segment(ctx App, res http.ResponseWriter, req *http.Request)
 		VideoCachePath,
 		req.URL.Query().Get("path"),
 	)
-	if _, err := os.Stat(cachePath); os.IsNotExist(err) {
-		Log.Info("[plugin hls]: invalid video")
-		res.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
 
 	transcodedSegmentPath := filepath.Join(
 		cachePath + "_transcoded",
